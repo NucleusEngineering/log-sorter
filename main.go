@@ -24,7 +24,24 @@ import (
 
 	"cloud.google.com/go/storage"
 	cloudevents "github.com/cloudevents/sdk-go/v2"
+	"github.com/cloudevents/sdk-go/v2/event/datacodec/json"
 )
+
+type PubSubMessage struct {
+	Message struct {
+		Data []byte `json:"data,omitempty"`
+		ID   string `json:"id"`
+	} `json:"message"`
+	Subscription string `json:"subscription"`
+}
+
+type LogEntry struct {
+	JSONPayload struct {
+		TenantID string `json:"tenant_id"` // NOTE:custom field inserted via structured logging: https://cloud.google.com/logging/docs/structured-logging
+		JobID    string `json:"job_id"`    // NOTE:custom field inserted via structured logging
+	} `json:"jsonPayload"`
+	Timestamp time.Time `json:"receiveTimestamp"`
+}
 
 var (
 	targetBucket string
@@ -34,6 +51,7 @@ var (
 func eventHandler(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 
+	// Unpack CloudEvent
 	ce, err := cloudevents.NewEventFromHTTPRequest(r)
 	if err != nil {
 		log.Printf("failed to parse CloudEvent: %v", err)
@@ -41,26 +59,41 @@ func eventHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: unmarshal into correct interface
-	// can likely be found in
-	// "github.com/googleapis/google-cloudevents-go/cloud/..."
+	// Unmarshal PubSub message wrapper
+	var msg PubSubMessage
+	err = ce.DataAs(&msg)
+	if err != nil {
+		log.Printf("failed to unmarshal PubSubMessage: %v", err)
+		http.Error(w, "Bad Request: expected PubSubMessage", http.StatusBadRequest)
+		return
+	}
 
-	log.Printf("data payload is '%v'", ce.DataEncoded)
+	// Unmarshal Cloud Logging LogEntry
+	var entry LogEntry
+	err = json.Decode(ctx, msg.Message.Data, &entry)
+	if err != nil {
+		log.Printf("failed to unmarshal LogEntry: %v", err)
+		http.Error(w, "Bad Request: expected LogEntry", http.StatusBadRequest)
+		return
+	}
 
-	tenantID := "something"
-	jobID := "something"
-	unixMillis := time.Now().UnixMilli()
-	targetObject := fmt.Sprintf("%s/%s/%d.json", tenantID, jobID, unixMillis)
+	// Construct GCS object name
+	targetObject := fmt.Sprintf(
+		"%s/%s/%d.json",
+		entry.JSONPayload.TenantID,
+		entry.JSONPayload.JobID,
+		entry.Timestamp.UnixNano(),
+	)
 
+	// Write the log entry to GCS
 	writer := gcsClient.Bucket(targetBucket).Object(targetObject).NewWriter(ctx)
-	if _, err := writer.Write(ce.DataEncoded); err != nil {
+	if _, err := writer.Write(msg.Message.Data); err != nil {
 		log.Printf("failed to write to GCS: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
 	writer.Close()
-
 	w.Write([]byte("ok"))
 }
 
